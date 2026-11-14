@@ -12,12 +12,13 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Connects to the Python server (main.py) over a WebSocket and dispatches
- * "double_blink" and "drowsy_alert" events on the main thread.
+ * "double_blink", "single_blink" and "drowsy_alert" events on the main thread.
  */
 class BlinkClient(
     private val url: String,
     private val onDoubleBlink: () -> Unit,
-    private val onDrowsy: () -> Unit = {}
+    private val onDrowsy: () -> Unit = {},
+    private val onSingleBlink: () -> Unit = {}
 ) {
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -52,6 +53,7 @@ class BlinkClient(
                 when (text.trim()) {
                     "double_blink" -> handler.post { onDoubleBlink() }
                     "drowsy_alert" -> handler.post { onDrowsy() }
+                    "single_blink" -> handler.post { onSingleBlink() }
                 }
             }
 

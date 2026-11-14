@@ -18,8 +18,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var drowsinessAlarm: DrowsinessAlarm
     private var alarmDialog: AlertDialog? = null
 
-    private val smsPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* granted or not */ }
+    private val permissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { /* granted or not */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -32,7 +32,13 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        smsPermission.launch(Manifest.permission.RECEIVE_SMS)
+        permissions.launch(
+            arrayOf(
+                Manifest.permission.RECEIVE_SMS,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+        )
 
         speaker = Speaker(this)
         drowsinessAlarm = DrowsinessAlarm(this)
@@ -44,7 +50,8 @@ class MainActivity : AppCompatActivity() {
         blinkClient = BlinkClient(
             url = "ws://10.18.91.234:8765",
             onDoubleBlink = { readMessages() },
-            onDrowsy = { triggerDrowsinessAlarm() }
+            onDrowsy = { triggerDrowsinessAlarm() },
+            onSingleBlink = { openNearestGasStation() }
         )
         blinkClient.start()
 
@@ -69,6 +76,21 @@ class MainActivity : AppCompatActivity() {
                 dialog.dismiss()
             }
             .show()
+    }
+
+    private fun openNearestGasStation() {
+        val started = GasStationNavigator.navigate(this) { station ->
+            if (station != null) {
+                val km = station.distanceMeters / 1000f
+                speaker.speak(
+                    "Navigating to ${station.name}, " +
+                            String.format(java.util.Locale.US, "%.1f", km) + " kilometers away."
+                )
+            } else {
+                speaker.speak("Sorry, I could not find a gas station nearby.")
+            }
+        }
+        if (started) speaker.speak("Finding the nearest gas station.")
     }
 
     private fun readMessages() {
