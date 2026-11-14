@@ -11,17 +11,17 @@ import okhttp3.WebSocketListener
 import java.util.concurrent.TimeUnit
 
 /**
- * Connects to the Python server (main.py) over a WebSocket and calls
- * [onDoubleBlink] on the main thread whenever the server sends "double_blink".
- * Reconnects automatically if the connection drops.
+ * Connects to the Python server (main.py) over a WebSocket and dispatches
+ * "double_blink" and "drowsy_alert" events on the main thread.
  */
 class BlinkClient(
     private val url: String,
-    private val onDoubleBlink: () -> Unit
+    private val onDoubleBlink: () -> Unit,
+    private val onDrowsy: () -> Unit = {}
 ) {
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)      // notices a dead connection
+        .pingInterval(20, TimeUnit.SECONDS)
         .build()
     private val handler = Handler(Looper.getMainLooper())
     private var socket: WebSocket? = null
@@ -48,7 +48,11 @@ class BlinkClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (text == "double_blink") handler.post { onDoubleBlink() }
+                Log.d("BlinkClient", "Received: '$text'")
+                when (text.trim()) {
+                    "double_blink" -> handler.post { onDoubleBlink() }
+                    "drowsy_alert" -> handler.post { onDrowsy() }
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
