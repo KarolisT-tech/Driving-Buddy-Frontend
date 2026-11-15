@@ -27,24 +27,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Single blink -> find the closest gas station -> start Google Maps
- * turn-by-turn navigation to it immediately. The user never picks anything.
- *
- * Speed:
- *  - Location: uses the last known position instantly, waits max 3 s otherwise.
- *  - Stations: asks several OpenStreetMap (Overpass) servers AT THE SAME TIME
- *    and uses the first answer. Hard limit of [LOOKUP_TIMEOUT_MS].
- *
- * Navigation is started with google.navigation:q=<lat>,<lon>&mode=d, which goes
- * straight into driving navigation from the current location (no list, no Start button).
+ * Finds the nearest gas station via OpenStreetMap (Overpass) and launches
+ * Google Maps turn-by-turn driving navigation. If Overpass times out or is
+ * unavailable, falls back to opening Google Maps with a nearby gas station search.
  */
 object GasStationNavigator {
 
     private const val TAG = "GasStationNavigator"
     private const val COOLDOWN_MS = 30_000L
     private const val LOCATION_TIMEOUT_MS = 3_000L
-    private const val LOOKUP_TIMEOUT_MS = 6_000L
-    private const val SEARCH_RADIUS_METERS = 15_000
+    private const val LOOKUP_TIMEOUT_MS = 10_000L
+    private const val SEARCH_RADIUS_METERS = 5_000
 
     // Public Overpass servers; all are queried in parallel, first good answer wins.
     private val OVERPASS_SERVERS = listOf(
@@ -54,19 +47,25 @@ object GasStationNavigator {
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
     )
 
-    data class Station(val name: String, val lat: Double, val lon: Double, val distanceMeters: Float)
+    data class Station(
+        val name: String,
+        val lat: Double,
+        val lon: Double,
+        val distanceMeters: Float
+    )
 
+    @Volatile
     private var lastLaunch = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
     private val http = OkHttpClient.Builder()
-        .connectTimeout(4, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(LOOKUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .callTimeout(LOOKUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
     /**
      * Starts the lookup. [onResult] runs on the main thread with the station Maps
-     * is navigating to, or null if no station could be found (Maps is NOT opened then).
+     * is navigating to (or a fallback search marker), or null if location/Maps failed.
      * Returns false if skipped because of the cooldown.
      */
     fun navigate(context: Context, onResult: (Station?) -> Unit = {}): Boolean {
@@ -97,10 +96,25 @@ object GasStationNavigator {
 
             findNearestStation(location) { station ->
                 Log.d(TAG, "Lookup done after ${SystemClock.elapsedRealtime() - t0} ms: $station")
-                if (station != null && startNavigation(appContext, station)) {
-                    onResult(station)
+
+                val launched = if (station != null) {
+                    startTurnByTurnNavigation(appContext, station)
                 } else {
-                    lastLaunch = 0L  // allow an immediate retry
+                    Log.w(TAG, "Overpass returned null; falling back to Google Maps search")
+                    startFallbackSearch(appContext, location)
+                }
+
+                if (launched) {
+                    onResult(
+                        station ?: Station(
+                            name = "Nearest gas station",
+                            lat = location.latitude,
+                            lon = location.longitude,
+                            distanceMeters = 0f
+                        )
+                    )
+                } else {
+                    lastLaunch = 0L // allow an immediate retry
                     onResult(null)
                 }
             }
@@ -161,52 +175,64 @@ object GasStationNavigator {
 
     private fun findNearestStation(here: Location, callback: (Station?) -> Unit) {
         val query = """
-            [out:json][timeout:5];
+            [out:json][timeout:8];
             nwr["amenity"="fuel"](around:$SEARCH_RADIUS_METERS,${here.latitude},${here.longitude});
             out center;
         """.trimIndent()
 
         val finished = AtomicBoolean(false)
         val pending = AtomicInteger(OVERPASS_SERVERS.size)
-        val calls = mutableListOf<Call>()
-
-        fun finish(station: Station?) {
-            if (!finished.compareAndSet(false, true)) return
-            calls.forEach { it.cancel() }          // stop the slower servers
-            mainHandler.post { callback(station) }
-        }
-
-        // Hard overall limit.
-        mainHandler.postDelayed({ finish(null) }, LOOKUP_TIMEOUT_MS + 500)
-
-        for (url in OVERPASS_SERVERS) {
+        val calls = OVERPASS_SERVERS.map { url ->
             val request = Request.Builder()
                 .url(url)
                 .header("User-Agent", "DrivingBuddy/1.0 (Android)")
                 .post(FormBody.Builder().add("data", query).build())
                 .build()
+            url to http.newCall(request)
+        }
 
-            val call = http.newCall(request)
-            calls += call
+        val overallTimeout = Runnable {}
+        fun finish(station: Station?) {
+            if (!finished.compareAndSet(false, true)) return
+            mainHandler.removeCallbacks(overallTimeout)
+            calls.forEach { (_, call) -> call.cancel() }
+            mainHandler.post { callback(station) }
+        }
+
+        val timeoutTask = Runnable { finish(null) }
+        mainHandler.postDelayed(timeoutTask, LOOKUP_TIMEOUT_MS + 500)
+
+        for ((url, call) in calls) {
             call.enqueue(object : Callback {
                 override fun onResponse(call: Call, response: Response) {
                     response.use {
                         val nearest = try {
                             if (!it.isSuccessful) throw IOException("HTTP ${it.code}")
-                            parseStations(it.body!!.string(), here).minByOrNull { s -> s.distanceMeters }
+                            val body = it.body?.string() ?: throw IOException("Empty response body")
+                            parseStations(body, here).minByOrNull { s -> s.distanceMeters }
                         } catch (e: Exception) {
                             Log.w(TAG, "$url failed: ${e.message}")
                             null
                         }
                         Log.d(TAG, "$url answered: $nearest")
-                        if (nearest != null) finish(nearest)
-                        else if (pending.decrementAndGet() == 0) finish(null)
+                        if (nearest != null) {
+                            mainHandler.removeCallbacks(timeoutTask)
+                            finish(nearest)
+                        } else if (pending.decrementAndGet() == 0) {
+                            mainHandler.removeCallbacks(timeoutTask)
+                            finish(null)
+                        }
                     }
                 }
 
                 override fun onFailure(call: Call, e: IOException) {
-                    if (!call.isCanceled()) Log.w(TAG, "$url failed: ${e.message}")
-                    if (pending.decrementAndGet() == 0) finish(null)
+                    if (!finished.get()) {
+                        Log.w(TAG, "$url failed (canceled=${call.isCanceled()}): ${e.message}")
+                    }
+                    if (pending.decrementAndGet() == 0) {
+                        mainHandler.removeCallbacks(timeoutTask)
+                        finish(null)
+                    }
                 }
             })
         }
@@ -235,14 +261,23 @@ object GasStationNavigator {
     }
 
     // ------------------------------------------------------------------
-    // Start navigation (no user input)
+    // Start navigation
     // ------------------------------------------------------------------
 
-    private fun startNavigation(context: Context, station: Station): Boolean {
+    private fun startTurnByTurnNavigation(context: Context, station: Station): Boolean {
         val navUri = Uri.parse("google.navigation:q=${station.lat},${station.lon}&mode=d")
-        Log.d(TAG, "Starting navigation: $navUri (${station.name})")
+        Log.d(TAG, "Starting turn-by-turn navigation to ${station.name}: $navUri")
+        return launchGoogleMaps(context, navUri)
+    }
 
-        val mapsIntent = Intent(Intent.ACTION_VIEW, navUri)
+    private fun startFallbackSearch(context: Context, here: Location): Boolean {
+        val searchUri = Uri.parse("geo:${here.latitude},${here.longitude}?q=" + Uri.encode("gas station"))
+        Log.d(TAG, "Showing nearby gas stations: $searchUri")
+        return launchGoogleMaps(context, searchUri)
+    }
+
+    private fun launchGoogleMaps(context: Context, uri: Uri): Boolean {
+        val mapsIntent = Intent(Intent.ACTION_VIEW, uri)
             .setPackage("com.google.android.apps.maps")
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
